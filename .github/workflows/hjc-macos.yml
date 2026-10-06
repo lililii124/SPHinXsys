@@ -1,0 +1,155 @@
+name: HJC macOS verification
+
+on:
+  push:
+    branches: ['verify/hjc-macos-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  VCPKG_VERSION: '2026.04.27'
+  VCPKG_DEFAULT_TRIPLET: x64-osx
+  CTEST_PARALLEL_LEVEL: '1'
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+  TESTED_REVISION: 'a945ec98e67d364b61b740d2a8833da5f873e55a'
+
+jobs:
+  hjc-macos:
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Xiangyu-Hu/SPHinXsys
+          ref: ${{ env.TESTED_REVISION }}
+          path: source
+          persist-credentials: false
+
+      - uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.x'
+
+      - name: Record native environment
+        run: |
+          mkdir -p evidence
+          {
+            sw_vers
+            uname -m
+            clang++ --version
+            cmake --version
+            sysctl -n hw.ncpu
+            git -C source rev-parse HEAD
+          } | tee evidence/environment.log
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = x86_64
+          test "$(git -C source rev-parse HEAD)" = "$TESTED_REVISION"
+
+      - name: Install system dependencies
+        run: |
+          brew reinstall gfortran
+          brew install pkg-config git ninja autoconf automake autoconf-archive
+
+      - uses: friendlyanon/setup-vcpkg@v1
+        with:
+          committish: ${{ env.VCPKG_VERSION }}
+          cache-version: ${{ env.VCPKG_VERSION }}
+
+      - name: Install the upstream macOS dependencies
+        run: |
+          vcpkg/vcpkg install --clean-after-build \
+            eigen3 tbb boost-program-options boost-geometry gtest simbody spdlog \
+            2>&1 | tee evidence/dependencies.log
+          vcpkg/vcpkg list | tee evidence/dependency-versions.log
+
+      - name: Configure 3D HJC targets
+        run: |
+          cmake -G Ninja -S source -B build \
+            -D CMAKE_CXX_COMPILER=clang++ \
+            -D CMAKE_BUILD_TYPE=Release \
+            -D CMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -D SPHINXSYS_2D=OFF \
+            -D SPHINXSYS_3D=ON \
+            -D SPHINXSYS_BUILD_TESTS=ON \
+            -D SPHINXSYS_BUILD_2D_EXAMPLES=OFF \
+            -D SPHINXSYS_BUILD_3D_EXAMPLES=ON \
+            -D SPHINXSYS_BUILD_UNIT_TESTS=ON \
+            -D SPHINXSYS_BUILD_OPTIMIZATION_EXAMPLES=OFF \
+            -D SPHINXSYS_BUILD_EXTRA_SOURCE_AND_TESTS=OFF \
+            -D SPHINXSYS_BUILD_MODULES=OFF \
+            -D SPHINXSYS_BUILD_PYTHON_INTERFACE=OFF \
+            -D TEST_STATE_RECORDING=OFF \
+            2>&1 | tee evidence/configure.log
+
+      - name: Build HJC material and Taylor-bar example
+        run: |
+          cmake --build build --target test_hjc test_3d_taylor_bar_hjc \
+            --parallel 4 2>&1 | tee evidence/build.log
+
+      - name: Check the selected tests
+        run: |
+          ctest --test-dir build --show-only=json-v1 \
+            -R '^HJC\.|^test_3d_taylor_bar_hjc$' > evidence/test-list.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          tests = json.loads(Path('evidence/test-list.json').read_text())['tests']
+          names = [test['name'] for test in tests]
+          assert len(names) == 11, names
+          assert names.count('test_3d_taylor_bar_hjc') == 1, names
+          assert sum(name.startswith('HJC.') for name in names) == 10, names
+          print('\n'.join(names))
+          PY
+
+      - name: Run HJC material and impact regression tests
+        run: |
+          ctest --test-dir build -R '^HJC\.|^test_3d_taylor_bar_hjc$' \
+            --verbose --output-junit "$GITHUB_WORKSPACE/evidence/ctest.xml" \
+            2>&1 | tee evidence/ctest.log
+
+      - name: Check particle count and saved response curves
+        run: |
+          python3 - <<'PY'
+          import json
+          import math
+          from pathlib import Path
+          case = Path('build/tests/3d_examples/test_3d_taylor_bar_hjc/smoke')
+          metadata = json.loads((case / 'case.json').read_text())
+          assert metadata['particles'] == 1600, metadata
+          assert metadata['initial_gap'] == 0.001, metadata
+          curves = {}
+          for quantity in ('TotalKineticEnergy', 'TotalHJCDamage'):
+              lines = (case / 'output' / f'Concrete_{quantity}.dat').read_text().splitlines()
+              samples = [[float(value) for value in line.split()] for line in lines[1:] if line.strip()]
+              assert len(samples) == 31, (quantity, len(samples))
+              for i, sample in enumerate(samples):
+                  assert len(sample) == 2 and all(map(math.isfinite, sample)), sample
+                  assert math.isclose(sample[0], i * 2e-6, rel_tol=0, abs_tol=1e-12), sample
+                  assert sample[1] >= 0, sample
+                  if quantity == 'TotalHJCDamage':
+                      assert sample[1] <= 1, sample
+              curves[quantity] = samples
+          result = {'case': metadata, 'curves': curves}
+          Path('evidence/response-curves.json').write_text(json.dumps(result, indent=2) + '\n')
+          print(json.dumps(metadata, indent=2))
+          print('Saved 31 samples of kinetic energy and mean damage.')
+          PY
+
+      - name: Save macOS evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hjc-macos-intel
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            evidence/
+            build/CMakeCache.txt
+            build/Testing/Temporary/LastTest.log
+            build/tests/3d_examples/test_3d_taylor_bar_hjc/smoke/case.json
+            build/tests/3d_examples/test_3d_taylor_bar_hjc/smoke/history.csv
+            build/tests/3d_examples/test_3d_taylor_bar_hjc/smoke/output/*.dat
